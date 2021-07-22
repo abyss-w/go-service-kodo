@@ -42,19 +42,38 @@ func (s *Storage) createDir(ctx context.Context, path string, opt pairStorageCre
 
 	rp := s.getAbsPath(path)
 
-	// Add `/` at the end of path to simulate directory.
+	// Add `/` at the end of `path` to simulate a directory.
 	// ref: https://developer.qiniu.com/kodo/kb/1705/how-to-create-the-folder-under-the-space
 	rp += "/"
 
-	uploader := qs.NewFormUploader(s.bucket.Cfg)
-	ret := qs.PutRet{}
-	err = uploader.Put(ctx,
-		&ret, s.putPolicy.UploadToken(s.bucket.Mac), rp, io.LimitReader(nil, 0), 0, nil)
-	if err != nil {
+	// kodo `put` doesn't support `overwrite`, so we need to check whether the dir exists.
+	// ref: [GSP-134](https://github.com/beyondstorage/go-storage/blob/master/docs/rfcs/134-write-behavior-consistency.md)
+	fi, err := s.bucket.Stat(s.name, rp)
+	if err == nil {
+		// The dir is exist.
+		o = s.newObject(true)
+		o.SetLastModified(convertUnixTimestampToTime(fi.PutTime))
+		o.SetContentLength(fi.Fsize)
+
+		var sm ObjectSystemMetadata
+		sm.StorageClass = fi.Type
+		o.SetSystemMetadata(sm)
+	} else if !checkError(err, responseCodeResourceNotExist) {
+		// Something error other then ResourceNotExist happened, return directly.
 		return
+	} else {
+		// The dir is not exist, we should create the dir.
+		uploader := qs.NewFormUploader(s.bucket.Cfg)
+		ret := qs.PutRet{}
+		err = uploader.Put(ctx,
+			&ret, s.putPolicy.UploadToken(s.bucket.Mac), rp, io.LimitReader(nil, 0), 0, nil)
+		if err != nil {
+			return
+		}
+
+		o = s.newObject(false)
 	}
 
-	o = s.newObject(true)
 	o.Path = path
 	o.ID = rp
 	o.Mode = ModeDir
@@ -92,6 +111,12 @@ func (s *Storage) list(ctx context.Context, path string, opt pairStorageList) (o
 	input := &objectPageStatus{
 		limit:  1000,
 		prefix: s.getAbsPath(path),
+	}
+
+	if !opt.HasListMode {
+		// Support `ListModePrefix` as the default `ListMode`.
+		// ref: [GSP-654](https://github.com/beyondstorage/go-storage/blob/master/docs/rfcs/654-unify-list-behavior.md)
+		opt.ListMode = ListModePrefix
 	}
 
 	var nextFn NextObjectFunc
@@ -267,11 +292,23 @@ func (s *Storage) stat(ctx context.Context, path string, opt pairStorageStat) (o
 }
 
 func (s *Storage) write(ctx context.Context, path string, r io.Reader, size int64, opt pairStorageWrite) (n int64, err error) {
+	rp := s.getAbsPath(path)
+
+	// kodo `put` doesn't support `overwrite`, so we need to check and delete the object if exists.
+	// ref: [GSP-134](https://github.com/beyondstorage/go-storage/blob/master/docs/rfcs/134-write-behavior-consistency.md)
+	_, err = s.bucket.Stat(s.name, rp)
+	if err == nil {
+		err = s.bucket.Delete(s.name, rp)
+		if err != nil {
+			return
+		}
+	} else if !checkError(err, responseCodeResourceNotExist) {
+		return
+	}
+
 	if opt.HasIoCallback {
 		r = iowrap.CallbackReader(r, opt.IoCallback)
 	}
-
-	rp := s.getAbsPath(path)
 
 	uploader := qs.NewFormUploader(s.bucket.Cfg)
 	ret := qs.PutRet{}
